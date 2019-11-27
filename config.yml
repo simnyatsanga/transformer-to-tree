@@ -1,0 +1,22 @@
+transformer:
+  embed_dim: 256
+  hidden_dim: 256
+  ff_dim: 2048
+  num_layers: 6
+  attention_dim: 512
+  num_heads: 8
+  dropout_rate: 0.1
+  warmup: 4000
+  base_lr: 2.0
+data:
+  batch_size: 64
+  max_batch_size: 5000
+  max_sample_size: 250
+  percent: .10
+  tokenizer: "subword"
+training:
+  num_epochs: 10
+  print_freq: 20
+  lr: 0.001
+  checkpoint: true
+  save_freq: 5
