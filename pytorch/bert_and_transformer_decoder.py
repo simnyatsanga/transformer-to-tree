@@ -1,23 +1,19 @@
-import seaborn
 import numpy as np
-import math, copy, time
+import pandas as pd
 import spacy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchtext import data, datasets
+import math, copy, time
 from torch.autograd import Variable
 import matplotlib.pyplot as plt
-seaborn.set_context(context="talk")
-
-# Use SpaCy to download IWSLT German-English Translation data
-# !pip install torchtext spacy
-# !python -m spacy download en
-# !python -m spacy download de
+import torchtext
+from torchtext import data, datasets
+from keras.preprocessing.sequence import pad_sequences
+from transformers import *
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-# Encoder Decoder Wrapper
 class EncoderDecoder(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many 
@@ -42,8 +38,6 @@ class EncoderDecoder(nn.Module):
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
 
-
-# Feed Forward and Softmax for final word prediction
 class Generator(nn.Module):
     "Define standard linear + softmax generation step."
     def __init__(self, d_model, vocab):
@@ -53,12 +47,10 @@ class Generator(nn.Module):
     def forward(self, x):
         return F.log_softmax(self.proj(x), dim=-1)
 
-# Creating the stacked (self-attention + FC) layers for the encoder or decoder
 def clones(module, N):
     "Produce N identical layers."
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
-# Encoder Wrapper which has multiple layers (N=6), each with "self-attention -> LayerNorm -> FC -> LayerNorm"
 class Encoder(nn.Module):
     "Core encoder is a stack of N layers"
     def __init__(self, layer, N):
@@ -72,7 +64,6 @@ class Encoder(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-# LayerNorm
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
     def __init__(self, features, eps=1e-6):
@@ -86,7 +77,6 @@ class LayerNorm(nn.Module):
         std = x.std(-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
-# Apply dropout to output of sublayer before adding the residual input and normalising the sum
 class SublayerConnection(nn.Module):
     """
     A residual connection followed by a layer norm.
@@ -101,7 +91,6 @@ class SublayerConnection(nn.Module):
         "Apply residual connection to any sublayer with the same size."
         return x + self.dropout(sublayer(self.norm(x)))
 
-# Single Encoder layer with a self-attention and FC layer
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward (defined below)"
     def __init__(self, size, self_attn, feed_forward, dropout):
@@ -116,8 +105,6 @@ class EncoderLayer(nn.Module):
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
         return self.sublayer[1](x, self.feed_forward)
 
-# Encoder Wrapper which has multiple layers (N=6), each with "masked self-attention for
-# encoder output -> LayerNorm -> self-attention-> LayerNorm-> FC -> LayerNorm"
 class Decoder(nn.Module):
     "Generic N layer decoder with masking."
     def __init__(self, layer, N):
@@ -130,7 +117,6 @@ class Decoder(nn.Module):
             x = layer(x, memory, src_mask, tgt_mask)
         return self.norm(x)
 
-# Single Decoder layer with masked self-attention, self-attention and FC layer
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
@@ -148,14 +134,12 @@ class DecoderLayer(nn.Module):
         x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
         return self.sublayer[2](x, self.feed_forward)
 
-# Subsequent Mask that ensures that self-attention only attends to positions before the token about to be predicted
 def subsequent_mask(size):
     "Mask out subsequent positions."
     attn_shape = (1, size, size)
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     return torch.from_numpy(subsequent_mask) == 0
 
-# Attention function
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1)
@@ -168,7 +152,6 @@ def attention(query, key, value, mask=None, dropout=None):
         p_attn = dropout(p_attn)
     return torch.matmul(p_attn, value), p_attn
 
-# Multi-head Attention
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
         "Take in model size and number of heads."
@@ -202,7 +185,6 @@ class MultiHeadedAttention(nn.Module):
              .view(nbatches, -1, self.h * self.d_k)
         return self.linears[-1](x)
 
-# Point-wise Feed-Forward Layer (FC Layer)
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
     def __init__(self, d_model, d_ff, dropout=0.1):
@@ -214,7 +196,6 @@ class PositionwiseFeedForward(nn.Module):
     def forward(self, x):
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
 
-# Embedding Layer used by Encoder and Decoder stacks
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
         super(Embeddings, self).__init__()
@@ -224,8 +205,6 @@ class Embeddings(nn.Module):
     def forward(self, x):
         return self.lut(x) * math.sqrt(self.d_model)
 
-# Positional Encoding for injecting order information of the input and output
-# sequences into the encoder and decoder, respectively
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
     def __init__(self, d_model, dropout, max_len=5000):
@@ -247,30 +226,56 @@ class PositionalEncoding(nn.Module):
                          requires_grad=False)
         return self.dropout(x)
 
-# Full Transformer Model Constructor
+# Examples of pre-trained Transformer-based models that are available
+MODELS = [(BertModel,       BertTokenizer,       'bert-base-uncased'),
+          (OpenAIGPTModel,  OpenAIGPTTokenizer,  'openai-gpt'),
+          (GPT2Model,       GPT2Tokenizer,       'gpt2'),
+          (CTRLModel,       CTRLTokenizer,       'ctrl'),
+          (TransfoXLModel,  TransfoXLTokenizer,  'transfo-xl-wt103'),
+          (XLNetModel,      XLNetTokenizer,      'xlnet-base-cased'),
+          (XLMModel,        XLMTokenizer,        'xlm-mlm-enfr-1024'),
+          (DistilBertModel, DistilBertTokenizer, 'distilbert-base-uncased'),
+          (RobertaModel,    RobertaTokenizer,    'roberta-base')]
+
+class BERTEncoder(nn.Module):
+    def __init__(self):
+        super(BERTEncoder, self).__init__()
+        self.model = BertModel.from_pretrained('bert-base-uncased')
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    def forward(self, x, mask):
+        # NOTE: torch.no_grad() means the BERT params are frozen
+        with torch.no_grad():
+            # Not using the mask here for now ...
+            output = self.model(x)
+        return output
+
 def make_model(src_vocab, tgt_vocab, N=6, 
-               d_model=512, d_ff=2048, h=8, dropout=0.1):
+               d_model=768, d_ff=2048, h=8, dropout=0.1):
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
+    encoder = BERTEncoder()
+    decoder = Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N)
+
+    # This was important from their code. 
+    # Initialize parameters with Glorot / fan_avg.
+    # NOTE: Only use xavier initialisation for decoder params. Don't touch the BERT params!
+    for p in decoder.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform(p)
+
     model = EncoderDecoder(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-        Decoder(DecoderLayer(d_model, c(attn), c(attn), 
-                             c(ff), dropout), N),
+        encoder,
+        decoder,
         nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
         Generator(d_model, tgt_vocab))
     
-    # This was important from their code. 
-    # Initialize parameters with Glorot / fan_avg.
-    for p in model.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform(p)
     return model
 
-# Batch Class for holding batches of masked input/output sentences
 class Batch:
     "Object for holding a batch of data with mask during training."
     def __init__(self, src, trg=None, pad=0):
@@ -291,7 +296,6 @@ class Batch:
             subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
         return tgt_mask
 
-# Training Loop
 def run_epoch(data_iter, model, loss_compute):
     "Standard Training and Logging Function"
     start = time.time()
@@ -299,6 +303,11 @@ def run_epoch(data_iter, model, loss_compute):
     total_loss = 0
     tokens = 0
     for i, batch in enumerate(data_iter):
+        batch.src = batch.src.to(DEVICE)
+        batch.trg = batch.trg.to(DEVICE)
+        batch.src_mask = batch.src_mask.to(DEVICE)
+        batch.trg_mask = batch.trg_mask.to(DEVICE)
+        batch.trg_y = batch.trg_y.to(DEVICE)
         out = model.forward(batch.src, batch.trg, 
                             batch.src_mask, batch.trg_mask)
         loss = loss_compute(out, batch.trg_y, batch.ntokens)
@@ -313,7 +322,7 @@ def run_epoch(data_iter, model, loss_compute):
             tokens = 0
     return total_loss / total_tokens
 
-# Batching the Data using torch text
+
 global max_src_in_batch, max_tgt_in_batch
 def batch_size_fn(new, count, sofar):
     "Keep augmenting batch and calculate total number of tokens + padding."
@@ -327,7 +336,6 @@ def batch_size_fn(new, count, sofar):
     tgt_elements = count * max_tgt_in_batch
     return max(src_elements, tgt_elements)
 
-# Specialised Transformer Optimiser
 class NoamOpt:
     "Optim wrapper that implements rate."
     def __init__(self, model_size, factor, warmup, optimizer):
@@ -359,8 +367,6 @@ def get_std_opt(model):
     return NoamOpt(model.src_embed[0].d_model, 2, 4000,
             torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
 
-
-# Regularisation using Label Smoothing
 class LabelSmoothing(nn.Module):
     "Implement label smoothing."
     def __init__(self, size, padding_idx, smoothing=0.0):
@@ -379,12 +385,11 @@ class LabelSmoothing(nn.Module):
         true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
         true_dist[:, self.padding_idx] = 0
         mask = torch.nonzero(target.data == self.padding_idx)
-        if mask.dim() > 0:
+        if mask.sum() and len(mask) > 0:
             true_dist.index_fill_(0, mask.squeeze(), 0.0)
         self.true_dist = true_dist
         return self.criterion(x, Variable(true_dist, requires_grad=False))
 
-# Simple Loss Computation
 class SimpleLossCompute:
     "A simple loss compute and train function."
     def __init__(self, generator, criterion, opt=None):
@@ -402,110 +407,105 @@ class SimpleLossCompute:
             self.opt.optimizer.zero_grad()
         return loss.data * norm
 
-# Loading Real World Data
-# For data loading.
-
-def load_english_german_translation_data():
-    spacy_de = spacy.load('de')
-    spacy_en = spacy.load('en')
-
-    def tokenize_de(text):
-        return [tok.text for tok in spacy_de.tokenizer(text)]
-
-    def tokenize_en(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-        
-
-    BOS_WORD = '<s>'
-    EOS_WORD = '</s>'
-    BLANK_WORD = "<blank>"
-    SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD)
-    TGT = data.Field(tokenize=tokenize_en, init_token = BOS_WORD, 
-                        eos_token = EOS_WORD, pad_token=BLANK_WORD)
-
+def preprocess_data(**kwargs):
+    BOS_WORD = kwargs['start_token']
+    EOS_WORD = kwargs['end_token']
+    BLANK_WORD = kwargs['pad_token']
     MAX_LEN = 100
-    train, val, test = datasets.IWSLT.splits(
-        exts=('.de', '.en'), fields=(SRC, TGT), 
-        filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and 
-            len(vars(x)['trg']) <= MAX_LEN)
-    MIN_FREQ = 2
-    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
-    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
-
-    return SRC, TGT, train, val, test
-
-def load_geo_data():
-    spacy_en = spacy.load('en')
 
     def tokenize_src(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-    
-    def tokenize_tgt(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-    
-    BOS_WORD = '<s>'
-    EOS_WORD = '</s>'
-    BLANK_WORD = "<blank>"
-    SRC = data.Field(tokenize=tokenize_src, pad_token=BLANK_WORD)
-    TGT = data.Field(tokenize=tokenize_tgt, init_token = BOS_WORD, 
-                        eos_token = EOS_WORD, pad_token=BLANK_WORD)
+        if kwargs['transformer'] == 'bert':
+            bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+            result = bert_tokenizer.encode(text, add_special_tokens=True)
+            result = pad_sequences([result], maxlen=100, dtype="long", truncating="post", padding="post")[0].tolist()
+            # print("Tokenization result %s" % (result))
+            return result
+        else:
+            spacy_en = spacy.load('en')
+            return [tok.text for tok in spacy_en.tokenizer(text)]
 
-    MAX_LEN = 120
-    train, val, test = data.TabularDataset.splits(
+    def tokenize_tgt(text):
+        if kwargs['transformer'] == 'bert':
+            bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+            result = bert_tokenizer.encode(text, add_special_tokens=True)
+            result = pad_sequences([result], maxlen=100, dtype="long", truncating="post", padding="post")[0].tolist()
+            # print("Tokenization result %s" % (result))
+            return result
+        else:
+            spacy_en = spacy.load('en')
+            return [tok.text for tok in spacy_en.tokenizer(text)]
+    
+    SRC = torchtext.data.Field(tokenize=tokenize_src, fix_length=MAX_LEN, pad_token=BLANK_WORD)
+    TGT = torchtext.data.Field(tokenize=tokenize_tgt, fix_length=MAX_LEN, pad_token=BLANK_WORD)
+
+    train, val, test = torchtext.data.TabularDataset.splits(
         path='./data/geo', train='geo880_train600.tsv',
         validation='geo880_dev100.tsv', test='geo880_test280.tsv',
         format='tsv', fields=[('src', SRC), ('trg', TGT)])
-    
+
     SRC.build_vocab(train.src)
     TGT.build_vocab(train.trg)
+
     return SRC, TGT, train, val, test
 
-def load_atis_data():
-    spacy_en = spacy.load('en')
+# SRC, TGT, train, val, test = preprocess_data(start_token='<s>', end_token='</s>', pad_token='blank', transformer=vanilla)
+SRC, TGT, train, val, test = preprocess_data(start_token='[CLS]', end_token='[SEP]', pad_token='[PAD]', transformer='bert')
 
-    def tokenize_src(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-    
-    def tokenize_tgt(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-    
-    BOS_WORD = '<s>'
-    EOS_WORD = '</s>'
-    BLANK_WORD = "<blank>"
-    SRC = data.Field(tokenize=tokenize_src, pad_token=BLANK_WORD)
-    TGT = data.Field(tokenize=tokenize_tgt, init_token = BOS_WORD, 
-                        eos_token = EOS_WORD, pad_token=BLANK_WORD)
+# def load_data_for_bert():
+#     train_df = pd.read_csv("data/geo/geo880_train600.tsv",
+#                             delimiter='\t',
+#                             header=None,
+#                             names=['nat_lang', 'logical_lang'])
+#     valid_df = pd.read_csv("data/geo/geo880_dev100.tsv",
+#                             delimiter='\t',
+#                             header=None,
+#                             names=['nat_lang', 'logical_lang'])
+#     test_df = pd.read_csv("data/geo/geo880_test280.tsv",
+#                             delimiter='\t',
+#                             header=None,
+#                             names=['nat_lang', 'logical_lang'])
+#     return train_df, valid_df, test_df
 
-    MAX_LEN = 120
-    train, val, test = data.TabularDataset.splits(
-        path='./data/atis', train='atis_train.tsv',
-        validation='atis_dev.tsv', test='atis_test.tsv',
-        format='tsv', fields=[('src', SRC), ('trg', TGT)])
-    
-    SRC.build_vocab(train.src)
-    TGT.build_vocab(train.trg)
-    return SRC, TGT, train, val, test
+# def preprocess_data_for_bert(train_df, valid_df, test_df):
+#      train_data = {'src': train_df.nat_lang.values.tolist(), 'trg': train_df.nat_lang.values.tolist()}
+#      valid_data = {'src': valid_df.nat_lang.values.tolist(), 'trg': valid_df.nat_lang.values.tolist()}
+#      test_data = {'src': test_df.nat_lang.values.tolist(), 'trg': test_df.nat_lang.values.tolist()}
 
-SRC, TGT, train, val, test = load_english_german_translation_data()
-# SRC, TGT, train, val, test = load_geo_data()
-# SRC, TGT, train, val, test = load_atis_data()
+#      bert_model = BertModel.from_pretrained('bert-base-uncased')
+#      bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-# Batch Iterator
-class MyIterator(data.Iterator):
+#      # Add special tokens takes care of adding [CLS], [SEP], <s>... tokens in the right way for each model.
+#      # BERT requires a fixed-length, so pad every sentence to a max length of 120 (found by looking at the geo data)
+#      # Convert all sentences into the tensor required by BERT
+#      train_input_ids = [bert_tokenizer.encode(x, add_special_tokens=True) for x in train_data['src']]
+#      train_input_ids = pad_sequences(train_input_ids, maxlen=120, dtype="long", truncating="post", padding="post")
+#      train_input_ids = torch.tensor(train_input_ids)
+     
+#      valid_input_ids = [bert_tokenizer.encode(x, add_special_tokens=True) for x in valid_data['src']]
+#      valid_input_ids = pad_sequences(valid_input_ids, maxlen=120, dtype="long", truncating="post", padding="post")
+#      valid_input_ids = torch.tensor(valid_input_ids)
+     
+#      test_input_ids = [bert_tokenizer.encode(x, add_special_tokens=True) for x in test_data['src']]
+#      test_input_ids = pad_sequences(test_input_ids, maxlen=120, dtype="long", truncating="post", padding="post")
+#      test_input_ids = torch.tensor(test_input_ids)
+
+# train_df, valid_df, test_df = load_data_for_bert()
+# preprocess_data_for_bert(train_df, valid_df, test_df)
+
+class MyIterator(torchtext.data.Iterator):
     def create_batches(self):
         if self.train:
-            def pool(d, random_shuffler):
-                for p in data.batch(d, self.batch_size * 100):
-                    p_batch = data.batch(
-                        sorted(p, key=self.sort_key),
+            def pool(data_set, random_shuffler):
+                for og_batch in torchtext.data.batch(data_set, self.batch_size * 100):
+                    p_batch = torchtext.data.batch(
+                        sorted(og_batch, key=self.sort_key),
                         self.batch_size, self.batch_size_fn)
                     for b in random_shuffler(list(p_batch)):
                         yield b
             self.batches = pool(self.data(), self.random_shuffler)
-            
         else:
             self.batches = []
-            for b in data.batch(self.data(), self.batch_size,
+            for b in torchtext.data.batch(self.data(), self.batch_size,
                                           self.batch_size_fn):
                 self.batches.append(sorted(b, key=self.sort_key))
 
@@ -515,9 +515,8 @@ def rebatch(pad_idx, batch):
     return Batch(src, trg, pad_idx)
 
 
-# Create model, criterion, optimiser and data iterator
 if True:
-    pad_idx = TGT.vocab.stoi["<blank>"]
+    pad_idx = TGT.vocab.stoi["[PAD]"]
     model = make_model(len(SRC.vocab), len(TGT.vocab), N=6)
     # model.cuda()
     model = model.to(DEVICE)
@@ -532,7 +531,6 @@ if True:
                             repeat=False, sort_key=lambda x: (len(x.src), len(x.trg)),
                             batch_size_fn=batch_size_fn, train=False)
 
-# Training the system
 model_opt = NoamOpt(model.src_embed[0].d_model, 1, 2000,
         torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
 for epoch in range(10):
@@ -546,10 +544,9 @@ for epoch in range(10):
                       model, 
                       SimpleLossCompute(model.generator, criterion, None))
     print(loss)
-    print("End of epoch %s ..." % (epoch))
-    torch.save(model.state_dict(), 'checkpoints/vanilla_transformer_%s' % (epoch))
+    print("Ending epoch %s ..." % (epoch))
+    torch.save(model.state_dict(), '/checkpoints/bert_and_transformer_decoder%s.pt' % (epoch))
 
-# Greedy decoding
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
     memory = model.encode(src, src_mask)
     ys = torch.ones(1, 1).fill_(start_symbol).type_as(src.data)
@@ -565,7 +562,6 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
                         torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
     return ys
 
-# Evaluating the system
 for i, batch in enumerate(valid_iter):
     src = batch.src.transpose(0, 1)[:1]
     src_mask = (src != SRC.vocab.stoi["<blank>"]).unsqueeze(-2)
@@ -586,9 +582,4 @@ for i, batch in enumerate(valid_iter):
         print(sym, end =" ")
     print()
     break
-
-
-
-
-
 

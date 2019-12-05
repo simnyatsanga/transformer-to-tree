@@ -31,7 +31,6 @@ class Encoder(nn.Module):
         input_ids = torch.tensor([self.tokenizer.encode(x, add_special_tokens=True)])
         with torch.no_grad():
             output = self.model(input_ids)
-        import ipdb; ipdb.set_trace()
         return output
 
 class Decoder(nn.Module):
@@ -40,8 +39,8 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
     
     def forward(self, x):
-        
+        print('Foo Bar')
 
 encoder = Encoder()
-print(encoder("Derp"))
+print(encoder("Hi Giuseppe!"))
         
